@@ -1,6 +1,6 @@
 # Scanner Bot
 
-Scanner Bot is a Go-based automation tool designed to process scanned receipts and documents. It watches a specified directory for new files, uploads them to Google's Gemini Pro Vision model for analysis, and automatically renames and organizes them based on their content.
+Scanner Bot is a Go-based automation tool designed to process scanned receipts and documents. It watches a specified directory for new files, uploads them to Google's Gemini API for analysis, and automatically renames and organizes them based on their content.
 
 I made this because I get so many paper receipts and certificates from doctors etc that it's getting messy to keep all the papers together.
 
@@ -10,30 +10,42 @@ It works :D
 
 ## Features
 
-- **Automated Directory Watching**: Monitors a folder for new scans (PDF, JPG, PNG, JPEG).
-- **AI-Powered Analysis**: Uses Google Gemini to extract date, vendor, category, and total amount from receipts.
-- **Smart Renaming**: Renames files to a standard format: `YYYY-MM-DD_Vendor_Amount円.ext`.
+- **Automated Directory Watching**: Monitors a folder for new scans (PDF, JPG, PNG, JPEG), including sweeping existing files on startup.
+- **AI-Powered Analysis**: Uses Google Gemini (`google.golang.org/genai`) with structured outputs to extract date, vendor, category, and total amount from receipts.
+- **Smart Renaming**: Renames files to a standard format: `YYYY-MM-DD_Vendor_Amount円.ext` (with automatic collision numbering `_1`, `_2`, etc.).
 - **Categorization**: Moves processed files into subdirectories based on their category (e.g., Grocery, Medical, Tax).
 - **Multi-Receipt Support**: handling multiple receipts on a single page if recognized by the AI.
 - **Originals Archiving**: Keeps the original raw scan in an `originals` folder.
-- **Robustness**: Handles file stability checks (waiting for scanners to finish writing) and atomic moves.
+- **Robustness**: Handles file stability checks (waiting for scanners to finish writing), context-aware graceful shutdown, and atomic/cross-device moves.
 
 ## Prerequisites
 
-- Go 1.21 or later
+- Go 1.23 or later
 - A Google Gemini API Key
 
 ## Installation
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/yourusername/scanner-bot.git
+    git clone https://github.com/inexcession/scanner-bot.git
     cd scanner-bot
     ```
 
 2.  **Build the binary:**
+
+    For your current machine:
     ```bash
     go build -o scanner-bot .
+    ```
+
+    To cross-compile for a Linux `amd64` server (e.g. from macOS Apple Silicon):
+    ```bash
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o scanner-bot .
+    ```
+
+    To run the unit tests:
+    ```bash
+    go test -v ./...
     ```
 
 3.  **Install (Linux/Systemd):**
@@ -65,14 +77,14 @@ You can run the bot manually from the command line:
 
 ```bash
 export GEMINI_API_KEY="your_api_key_here"
-./scanner-bot -watch "/path/to/watch/dir" -dest "/path/to/output/dir" -model "gemini-1.5-flash" -workers 2
+./scanner-bot -watch "/path/to/watch/dir" -dest "/path/to/output/dir" -model "gemini-flash-latest" -workers 2
 ```
 
 ### Flags
 
 - `-watch`: (Required) The directory to watch for new incoming scan files.
 - `-dest`: (Required) The root directory where processed files and the `originals` folder will be created.
-- `-model`: The Gemini model to use (default: "gemini-3-flash-preview").
+- `-model`: The Gemini model to use (default: "gemini-flash-latest").
 - `-syslog`: Enable logging to the system's syslog daemon (default: true).
 - `-workers`: Maximum number of concurrent files to process, to prevent Gemini API rate limits (default: 2).
 

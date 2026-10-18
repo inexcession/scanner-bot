@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,14 +16,14 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/google/generative-ai-go/genai"
-	"google.golang.org/api/option"
+	"google.golang.org/genai"
 )
 
 // --- CONFIGURATION ---
-const Version = "v1.01"
+const Version = "v1.02"
 
 var (
 	// Configurable paths via flags
@@ -33,6 +34,11 @@ var (
 	modelName        string
 	useSyslog        bool
 	concurrencyLimit int
+
+	// File stability timings (variables to allow fast overrides in tests)
+	stabilityThreshold = 10 * time.Second
+	stabilityPollWait  = 1 * time.Second
+	maxStabilityWait   = 5 * time.Minute
 )
 
 // ReceiptData maps the JSON response from Gemini
@@ -43,6 +49,47 @@ type ReceiptData struct {
 	Amount   int    `json:"total_amount"`
 }
 
+// Allowed receipt categories
+var validCategories = map[string]string{
+	"medical":   "Medical",
+	"grocery":   "Grocery",
+	"tax":       "Tax",
+	"utilities": "Utilities",
+	"septic":    "Septic",
+	"other":     "Other",
+	"unsorted":  "Unsorted",
+}
+
+// Structured output schema for Gemini receipt extraction
+var receiptResponseSchema = &genai.Schema{
+	Type:        genai.TypeArray,
+	Description: "List of receipts or certificates found in the document",
+	Items: &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"date": {
+				Type:        genai.TypeString,
+				Description: "Receipt date in YYYY-MM-DD format",
+			},
+			"vendor": {
+				Type:        genai.TypeString,
+				Description: "Japanese vendor name; if medical, use clinic name",
+			},
+			"category": {
+				Type:        genai.TypeString,
+				Format:      "enum",
+				Enum:        []string{"Medical", "Grocery", "Tax", "Utilities", "Septic", "Other"},
+				Description: "Expense category",
+			},
+			"total_amount": {
+				Type:        genai.TypeInteger,
+				Description: "Total amount in JPY as an integer",
+			},
+		},
+		Required: []string{"date", "vendor", "category", "total_amount"},
+	},
+}
+
 // Global tracker to prevent double-processing
 var activeFiles sync.Map
 
@@ -50,7 +97,7 @@ func main() {
 	// 0. Parse Flags
 	flag.StringVar(&watchDir, "watch", "", "Directory to watch for new receipts (required)")
 	flag.StringVar(&destDir, "dest", "", "Directory to save processed receipts (required)")
-	flag.StringVar(&modelName, "model", "gemini-3-flash-preview", "Gemini model to use")
+	flag.StringVar(&modelName, "model", "gemini-flash-latest", "Gemini model to use")
 	flag.BoolVar(&useSyslog, "syslog", true, "Enable syslog output")
 	flag.IntVar(&concurrencyLimit, "workers", 2, "Number of concurrent processing workers")
 	flag.Parse()
@@ -69,6 +116,9 @@ func main() {
 		flag.Usage()
 		log.Fatal("Both -watch and -dest flags are required")
 	}
+	if concurrencyLimit < 1 {
+		concurrencyLimit = 1
+	}
 
 	log.Printf("Starting scanner-bot %s", Version)
 
@@ -81,11 +131,13 @@ func main() {
 		log.Fatal("GEMINI_API_KEY environment variable not set")
 	}
 
-	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+	client, err := genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer client.Close()
 
 	// 2. Setup File Watcher
 	watcher, err := fsnotify.NewWatcher()
@@ -109,18 +161,7 @@ func main() {
 
 				// Trigger on any modification that might indicate a file is ready
 				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) || event.Has(fsnotify.Chmod) {
-					// DEDUPLICATION: Check if we are already handling this file
-					if _, loaded := activeFiles.LoadOrStore(event.Name, true); loaded {
-						continue
-					}
-					// Start processing in a new thread
-					wg.Add(1)
-					go func(path string) {
-						defer wg.Done()
-						semaphore <- struct{}{}
-						defer func() { <-semaphore }()
-						processEvent(ctx, client, path)
-					}(event.Name)
+					enqueueFile(ctx, client, semaphore, &wg, event.Name)
 				} else {
 					log.Printf("Ignored event: %v", event)
 				}
@@ -140,25 +181,71 @@ func main() {
 	log.Printf("Listening for receipts in %s...", watchDir)
 	log.Printf("Saving processed files to %s...", destDir)
 
+	// Sweep existing files already present in watchDir at startup
+	scanExistingFiles(ctx, client, semaphore, &wg, watchDir)
+
 	<-ctx.Done()
 	log.Println("Shutting down... waiting for pending tasks to finish")
 	wg.Wait()
 	log.Println("Shutdown complete.")
 }
 
-func processEvent(ctx context.Context, client *genai.Client, path string) {
-	defer activeFiles.Delete(path)
+// isSupportedReceiptFile checks whether path is a non-hidden supported image/PDF file
+func isSupportedReceiptFile(path string) bool {
+	base := filepath.Base(path)
+	if base == "" || strings.HasPrefix(base, ".") {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(base))
+	return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".pdf"
+}
 
-	log.Printf("Detected: %s. Waiting for write to complete...", path)
+// scanExistingFiles enqueues any supported files already present in dir on startup
+func scanExistingFiles(ctx context.Context, client *genai.Client, semaphore chan struct{}, wg *sync.WaitGroup, dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("Failed to read watch directory %s on startup: %v", dir, err)
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		enqueueFile(ctx, client, semaphore, wg, filepath.Join(dir, entry.Name()))
+	}
+}
 
-	if err := waitForStableFile(path); err != nil {
-		log.Printf("Processing aborted for %s: %v", path, err)
+// enqueueFile filters and deduplicates a file path before dispatching a worker goroutine
+func enqueueFile(ctx context.Context, client *genai.Client, semaphore chan struct{}, wg *sync.WaitGroup, path string) {
+	if !isSupportedReceiptFile(path) {
+		return
+	}
+	// DEDUPLICATION: Check if we are already handling this file
+	if _, loaded := activeFiles.LoadOrStore(path, true); loaded {
 		return
 	}
 
-	// Filter valid extensions
-	ext := strings.ToLower(filepath.Ext(path))
-	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".pdf" {
+	wg.Add(1)
+	go func(p string) {
+		defer wg.Done()
+		defer activeFiles.Delete(p)
+
+		select {
+		case semaphore <- struct{}{}:
+			defer func() { <-semaphore }()
+		case <-ctx.Done():
+			return
+		}
+
+		processEvent(ctx, client, p)
+	}(path)
+}
+
+func processEvent(ctx context.Context, client *genai.Client, path string) {
+	log.Printf("Detected: %s. Waiting for write to complete...", path)
+
+	if err := waitForStableFile(ctx, path); err != nil {
+		log.Printf("Processing aborted for %s: %v", path, err)
 		return
 	}
 
@@ -179,16 +266,16 @@ func processEvent(ctx context.Context, client *genai.Client, path string) {
 }
 
 // waitForStableFile monitors the file until size is constant for a duration
-func waitForStableFile(path string) error {
-	const stabilityThreshold = 10 * time.Second
-	const maxWaitTime = 5 * time.Minute
-
+func waitForStableFile(ctx context.Context, path string) error {
 	startTime := time.Now()
 	lastSize := int64(-1)
 	stableSince := time.Now()
 
+	ticker := time.NewTicker(stabilityPollWait)
+	defer ticker.Stop()
+
 	for {
-		if time.Since(startTime) > maxWaitTime {
+		if time.Since(startTime) > maxStabilityWait {
 			return fmt.Errorf("timeout waiting for file to stabilize")
 		}
 
@@ -205,40 +292,45 @@ func waitForStableFile(path string) error {
 		if currentSize != lastSize {
 			lastSize = currentSize
 			stableSince = time.Now()
-		} else {
-			if time.Since(stableSince) >= stabilityThreshold {
-				if currentSize > 0 {
-					return nil // Stable
-				}
-			}
+		} else if time.Since(stableSince) >= stabilityThreshold && currentSize > 0 {
+			return nil // Stable
 		}
 
-		time.Sleep(1 * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
 // analyzeReceipt uploads the file to Gemini and extracts receipt data
 func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]ReceiptData, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("error opening file: %w", err)
-	}
-	defer f.Close()
-
 	// Upload
-	model := client.GenerativeModel(modelName)
-	model.ResponseMIMEType = "application/json"
-
-	upFile, err := client.UploadFile(ctx, "", f, nil)
+	upFile, err := client.Files.UploadFromPath(ctx, path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("upload failed: %w", err)
 	}
-	defer client.DeleteFile(ctx, upFile.Name)
+	defer func(fileName string) {
+		delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if _, err := client.Files.Delete(delCtx, fileName, nil); err != nil {
+			log.Printf("Failed to delete uploaded file %s: %v", fileName, err)
+		}
+	}(upFile.Name)
 
-	// Wait for processing
+	// Wait for processing with a bounded timeout
+	pollCtx, pollCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer pollCancel()
+
 	for upFile.State == genai.FileStateProcessing {
-		time.Sleep(1 * time.Second)
-		upFile, err = client.GetFile(ctx, upFile.Name)
+		select {
+		case <-pollCtx.Done():
+			return nil, fmt.Errorf("interrupted waiting for remote file processing: %w", pollCtx.Err())
+		case <-time.After(1 * time.Second):
+		}
+
+		upFile, err = client.Files.Get(pollCtx, upFile.Name, nil)
 		if err != nil {
 			return nil, fmt.Errorf("check failed state: %w", err)
 		}
@@ -255,18 +347,24 @@ func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]R
     "category" (Medical, Grocery, Tax, Utilities, Septic, Other),
     "total_amount" (integer).`
 
-	resp, err := model.GenerateContent(ctx, genai.FileData{URI: upFile.URI}, genai.Text(prompt))
+	contents := []*genai.Content{
+		genai.NewContentFromParts([]*genai.Part{
+			genai.NewPartFromFile(*upFile),
+			genai.NewPartFromText(prompt),
+		}, genai.RoleUser),
+	}
+
+	resp, err := client.Models.GenerateContent(ctx, modelName, contents, &genai.GenerateContentConfig{
+		ResponseMIMEType: "application/json",
+		ResponseSchema:   receiptResponseSchema,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("gemini generate error: %w", err)
 	}
 
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+	jsonText := resp.Text()
+	if jsonText == "" {
 		return nil, fmt.Errorf("empty response from model")
-	}
-
-	var jsonText string
-	if txt, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
-		jsonText = string(txt)
 	}
 
 	return parseGeminiResponse(jsonText)
@@ -316,24 +414,73 @@ func saveAndArchive(srcPath string, dataList []ReceiptData) {
 	}
 }
 
+// sanitizeCategory validates category against the allowlist and defaults to "Unsorted"
+func sanitizeCategory(cat string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(cat))
+	if canonical, ok := validCategories[trimmed]; ok {
+		return canonical
+	}
+	return "Unsorted"
+}
+
+// sanitizeVendor removes whitespace, path separators, and control characters from a vendor name
+func sanitizeVendor(vendor string) string {
+	var b strings.Builder
+	for _, r := range vendor {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			continue
+		}
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			b.WriteRune('-')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	res := strings.Trim(b.String(), ".-")
+	if res == "" {
+		return "Unknown"
+	}
+	return res
+}
+
+// sanitizeDate ensures the date is in YYYY-MM-DD format, falling back to today's date
+func sanitizeDate(dateStr string) string {
+	trimmed := strings.TrimSpace(dateStr)
+	if _, err := time.Parse("2006-01-02", trimmed); err == nil {
+		return trimmed
+	}
+	return time.Now().Format("2006-01-02")
+}
+
+// uniquePath appends _1, _2, etc. before the file extension if the target path already exists
+func uniquePath(path string) string {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return path
+	}
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s_%d%s", base, i, ext)
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+}
+
 func saveProcessedFile(srcPath string, data ReceiptData) error {
-	vendor := strings.ReplaceAll(data.Vendor, " ", "")
-	vendor = strings.ReplaceAll(vendor, "/", "-")
+	vendor := sanitizeVendor(data.Vendor)
+	date := sanitizeDate(data.Date)
+	category := sanitizeCategory(data.Category)
 
-	if data.Date == "" {
-		data.Date = time.Now().Format("2006-01-02")
-	}
-	if data.Category == "" {
-		data.Category = "Unsorted"
-	}
-
-	processedFileName := fmt.Sprintf("%s_%s_%d円%s", data.Date, vendor, data.Amount, filepath.Ext(srcPath))
-	processedDir := filepath.Join(destDir, data.Category)
-	processedPath := filepath.Join(processedDir, processedFileName)
+	processedFileName := fmt.Sprintf("%s_%s_%d円%s", date, vendor, data.Amount, filepath.Ext(srcPath))
+	processedDir := filepath.Join(destDir, category)
 
 	if err := os.MkdirAll(processedDir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", processedDir, err)
 	}
+
+	processedPath := uniquePath(filepath.Join(processedDir, processedFileName))
 
 	if err := robustCopy(srcPath, processedPath); err != nil {
 		return fmt.Errorf("failed to copy to processed folder: %w", err)
@@ -346,12 +493,13 @@ func saveProcessedFile(srcPath string, data ReceiptData) error {
 func archiveOriginalFile(srcPath string) {
 	originalsDir := filepath.Join(destDir, "originals")
 	originalName := filepath.Base(srcPath)
-	originalsPath := filepath.Join(originalsDir, originalName)
 
 	if err := os.MkdirAll(originalsDir, 0755); err != nil {
 		log.Printf("Failed to create originals directory: %v", err)
 		return
 	}
+
+	originalsPath := uniquePath(filepath.Join(originalsDir, originalName))
 
 	if err := robustMove(srcPath, originalsPath); err != nil {
 		log.Printf("Failed to move to originals: %v", err)
@@ -360,7 +508,7 @@ func archiveOriginalFile(srcPath string) {
 	}
 }
 
-// robustCopy performs a simple copy of the file content
+// robustCopy performs a copy of the file content and checks close/flush errors
 func robustCopy(src, dst string) error {
 	sourceFile, err := os.Open(src)
 	if err != nil {
@@ -368,14 +516,22 @@ func robustCopy(src, dst string) error {
 	}
 	defer sourceFile.Close()
 
-	destFile, err := os.Create(dst)
+	destFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
-	defer destFile.Close()
 
-	_, err = io.Copy(destFile, sourceFile)
-	return err
+	_, copyErr := io.Copy(destFile, sourceFile)
+	closeErr := destFile.Close()
+	if copyErr != nil {
+		_ = os.Remove(dst)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(dst)
+		return closeErr
+	}
+	return nil
 }
 
 // robustMove tries atomic rename first, then falls back to Copy+Delete
@@ -387,7 +543,7 @@ func robustMove(src, dst string) error {
 	}
 
 	// If error is NOT cross-device, fail
-	if !strings.Contains(err.Error(), "cross-device link") {
+	if !errors.Is(err, syscall.EXDEV) && !strings.Contains(err.Error(), "cross-device link") {
 		return err
 	}
 
