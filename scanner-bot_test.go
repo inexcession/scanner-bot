@@ -379,4 +379,75 @@ func TestFormatUsageStats(t *testing.T) {
 	}
 }
 
+func TestYAMLString(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", `""`},
+		{"   ", `""`},
+		{"テスト医院", "テスト医院"},
+		{"2026-10-18", "2026-10-18"},
+		{"line1\nline2", `"line1\nline2"`},
+		{"with\ttab\rand \"quotes\"", `"with\ttab\rand \"quotes\""`},
+		{"key: value", `"key: value"`},
+		{"-leading-dash", `"-leading-dash"`},
+	}
 
+	for _, tt := range tests {
+		if got := yamlString(tt.input); got != tt.want {
+			t.Errorf("yamlString(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestNormalizeMedicalReceipt(t *testing.T) {
+	// 1. Pharmacy receipt with all 4 booleans false defaults to IsMedicine = true and InsuredCopayAmount = Amount
+	pharmacy := normalizeMedicalReceipt(ReceiptData{
+		Vendor:           "スギ薬局 大井町店",
+		Category:         "Medical",
+		Amount:           1420,
+		PatientName:      " 山田 花子 様\n",
+		ReimbursedAmount: -100,
+	})
+	if pharmacy.PatientName != "山田 花子" {
+		t.Errorf("PatientName = %q, want 山田 花子", pharmacy.PatientName)
+	}
+	if !pharmacy.IsMedicine || pharmacy.IsTreatment {
+		t.Errorf("pharmacy classification: IsMedicine=%v, IsTreatment=%v, want IsMedicine=true, IsTreatment=false", pharmacy.IsMedicine, pharmacy.IsTreatment)
+	}
+	if pharmacy.InsuredCopayAmount != 1420 {
+		t.Errorf("InsuredCopayAmount = %d, want 1420", pharmacy.InsuredCopayAmount)
+	}
+	if pharmacy.ReimbursedAmount != 0 {
+		t.Errorf("ReimbursedAmount = %d, want 0", pharmacy.ReimbursedAmount)
+	}
+
+	// 2. Clinic receipt with all 4 booleans false defaults to IsTreatment = true
+	clinic := normalizeMedicalReceipt(ReceiptData{
+		Vendor:   "東京サンプルクリニック",
+		Category: "Medical",
+		Amount:   2500,
+	})
+	if !clinic.IsTreatment || clinic.IsMedicine {
+		t.Errorf("clinic classification: IsTreatment=%v, IsMedicine=%v, want IsTreatment=true, IsMedicine=false", clinic.IsTreatment, clinic.IsMedicine)
+	}
+	if clinic.InsuredCopayAmount != 2500 {
+		t.Errorf("InsuredCopayAmount = %d, want 2500", clinic.InsuredCopayAmount)
+	}
+
+	// 3. Explicit uninsured amount prevents overriding InsuredCopayAmount
+	uninsuredOnly := normalizeMedicalReceipt(ReceiptData{
+		Vendor:          "サンプル歯科",
+		Category:        "Medical",
+		Amount:          5500,
+		UninsuredAmount: 5500,
+		IsOtherMedical:  true,
+	})
+	if uninsuredOnly.InsuredCopayAmount != 0 {
+		t.Errorf("InsuredCopayAmount = %d, want 0 when UninsuredAmount is non-zero", uninsuredOnly.InsuredCopayAmount)
+	}
+	if !uninsuredOnly.IsOtherMedical || uninsuredOnly.IsTreatment {
+		t.Errorf("expected IsOtherMedical=true and IsTreatment=false, got %+v", uninsuredOnly)
+	}
+}
