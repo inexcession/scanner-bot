@@ -161,6 +161,12 @@ func TestSanitization(t *testing.T) {
 	if got := sanitizePatientName(" 山田　太郎 様 \n"); got != "山田　太郎" {
 		t.Errorf("sanitizePatientName() = %q, want 山田　太郎", got)
 	}
+	if got := formatNTAPatient("山田 太郎 様"); got != "山田　太郎" {
+		t.Errorf("formatNTAPatient() = %q, want 山田　太郎 (with full-width space)", got)
+	}
+	if got := formatNTAProvider("医療法人社団ABC大井町サンプル循環器クリニック"); len([]rune(got)) > 20 || !strings.HasPrefix(got, "ＡＢＣ") {
+		t.Errorf("formatNTAProvider() = %q (len=%d), want corporate prefix stripped, full-width ASCII, and <= 20 runes", got, len([]rune(got)))
+	}
 }
 
 func TestDeduplicateReceipts(t *testing.T) {
@@ -200,32 +206,36 @@ func TestSaveAndArchiveWithCollisions(t *testing.T) {
 	// Simulate Gemini returning duplicate entries for the same Medical receipt in a single scan
 	receipts := []ReceiptData{
 		{
-			RawDate:      "令和8年10月18日",
-			Date:         "2026-10-18",
-			Vendor:       "テスト医院",
-			Category:     "Medical",
-			Amount:       1500,
-			PatientName:  "山田 太郎 様",
-			IsTreatment:  true,
-			IsMedicine:   false,
+			RawDate:            "令和8年10月18日",
+			Date:               "2026-10-18",
+			Vendor:             "テスト医院",
+			Category:           "Medical",
+			Amount:             3730,
+			InsuredCopayAmount: 3230,
+			UninsuredAmount:    500,
+			PatientName:        "山田 太郎 様",
+			IsTreatment:        true,
+			IsMedicine:         false,
 		},
 		{
-			RawDate:      "令和8年10月18日",
-			Date:         "2026-10-18",
-			Vendor:       "テスト医院",
-			Category:     "Medical",
-			Amount:       1500,
-			PatientName:  "山田 太郎 様",
-			IsTreatment:  true,
-			IsMedicine:   false,
+			RawDate:            "令和8年10月18日",
+			Date:               "2026-10-18",
+			Vendor:             "テスト医院",
+			Category:           "Medical",
+			Amount:             3730,
+			InsuredCopayAmount: 3230,
+			UninsuredAmount:    500,
+			PatientName:        "山田 太郎 様",
+			IsTreatment:        true,
+			IsMedicine:         false,
 		},
 	}
 
 	saveAndArchive(srcFile1, receipts)
 
 	// Verify Medical category saves as .zip containing both .pdf and .yaml with matching stem
-	firstProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_1500円.zip")
-	secondProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_1500円_1.zip")
+	firstProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_3730円.zip")
+	secondProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_3730円_1.zip")
 	archivedOriginal := filepath.Join(destTmp, "originals", "scan001.pdf")
 
 	for _, p := range []string{firstProcessed, archivedOriginal} {
@@ -258,10 +268,10 @@ func TestSaveAndArchiveWithCollisions(t *testing.T) {
 		entries[f.Name] = string(b)
 	}
 
-	if gotPDF, ok := entries["2026-10-18_テスト医院_1500円.pdf"]; !ok || gotPDF != "dummy-pdf-data" {
+	if gotPDF, ok := entries["2026-10-18_テスト医院_3730円.pdf"]; !ok || gotPDF != "dummy-pdf-data" {
 		t.Errorf("unexpected PDF entry in zip: ok=%v, content=%q", ok, gotPDF)
 	}
-	gotYAML, ok := entries["2026-10-18_テスト医院_1500円.yaml"]
+	gotYAML, ok := entries["2026-10-18_テスト医院_3730円.yaml"]
 	if !ok {
 		t.Fatalf("missing YAML entry in zip, entries: %v", entries)
 	}
@@ -269,9 +279,13 @@ func TestSaveAndArchiveWithCollisions(t *testing.T) {
 		"date: 2026-10-18",
 		"vendor: テスト医院",
 		"patient_name: 山田 太郎",
+		"insured_copay_amount: 3230",
+		"uninsured_amount: 500",
 		"treatment: true",
+		"医療を受けた人: 山田　太郎",
 		"診療・治療: 該当する",
-		"支払った医療費の金額: 1500",
+		"支払った医療費の金額: 3730",
+		`左のうち、補填される金額: ""`,
 		"支払年月日: 2026/10/18",
 	} {
 		if !strings.Contains(gotYAML, wantLine) {
@@ -289,7 +303,7 @@ func TestSaveAndArchiveWithCollisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	saveAndArchive(srcFile1, []ReceiptData{
-		{Date: "2026-10-18", Vendor: "テスト医院", Category: "Medical", Amount: 1500},
+		{Date: "2026-10-18", Vendor: "テスト医院", Category: "Medical", Amount: 3730},
 		{Date: "2026-10-18", Vendor: "スーパー", Category: "Grocery", Amount: 980},
 	})
 	groceryProcessed := filepath.Join(destTmp, "Grocery", "2026-10-18_スーパー_980円.pdf")
