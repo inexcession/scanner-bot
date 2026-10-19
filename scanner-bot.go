@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,7 +25,7 @@ import (
 )
 
 // --- CONFIGURATION ---
-const Version = "v1.05"
+const Version = "v1.06"
 
 var (
 	// Configurable paths via flags
@@ -44,11 +45,17 @@ var (
 
 // ReceiptData maps the JSON response from Gemini
 type ReceiptData struct {
-	RawDate  string `json:"raw_date"`
-	Date     string `json:"date"`
-	Vendor   string `json:"vendor"`
-	Category string `json:"category"`
-	Amount   int    `json:"total_amount"`
+	RawDate           string `json:"raw_date"`
+	Date              string `json:"date"`
+	Vendor            string `json:"vendor"`
+	Category          string `json:"category"`
+	Amount            int    `json:"total_amount"`
+	PatientName       string `json:"patient_name,omitempty"`
+	IsTreatment       bool   `json:"is_treatment,omitempty"`
+	IsMedicine        bool   `json:"is_medicine,omitempty"`
+	IsNursingCare     bool   `json:"is_nursing_care,omitempty"`
+	IsOtherMedical    bool   `json:"is_other_medical,omitempty"`
+	ReimbursedAmount  int    `json:"reimbursed_amount,omitempty"`
 }
 
 // Allowed receipt categories
@@ -79,7 +86,7 @@ var receiptResponseSchema = &genai.Schema{
 			},
 			"vendor": {
 				Type:        genai.TypeString,
-				Description: "Japanese vendor name; if medical, use clinic name",
+				Description: "Japanese vendor name; if medical, use clinic or pharmacy name",
 			},
 			"category": {
 				Type:        genai.TypeString,
@@ -89,11 +96,41 @@ var receiptResponseSchema = &genai.Schema{
 			},
 			"total_amount": {
 				Type:        genai.TypeInteger,
-				Description: "Total amount in JPY as an integer",
+				Description: "Total amount paid in JPY as an integer",
+			},
+			"patient_name": {
+				Type:        genai.TypeString,
+				Description: "For Medical receipts: patient full name (医療を受けた人) as printed on the receipt without honorifics like 様. Empty string if not medical or not printed.",
+			},
+			"is_treatment": {
+				Type:        genai.TypeBoolean,
+				Description: "For Medical receipts (NTA 医療費の区分 - 診療・治療): true if hospital, clinic, or dental consultation/treatment.",
+			},
+			"is_medicine": {
+				Type:        genai.TypeBoolean,
+				Description: "For Medical receipts (NTA 医療費の区分 - 医薬品購入): true if prescription pharmacy (調剤薬局) or drugstore medicine purchase.",
+			},
+			"is_nursing_care": {
+				Type:        genai.TypeBoolean,
+				Description: "For Medical receipts (NTA 医療費の区分 - 介護保険サービス): true if nursing care insurance service.",
+			},
+			"is_other_medical": {
+				Type:        genai.TypeBoolean,
+				Description: "For Medical receipts (NTA 医療費の区分 - その他の医療費): true if other qualifying medical expense (e.g. medical equipment, transportation).",
+			},
+			"reimbursed_amount": {
+				Type:        genai.TypeInteger,
+				Description: "For Medical receipts (NTA 左のうち、補填される金額): insurance or municipal reimbursement amount in JPY if explicitly stated on the receipt, otherwise 0.",
 			},
 		},
-		PropertyOrdering: []string{"raw_date", "date", "vendor", "category", "total_amount"},
-		Required:         []string{"raw_date", "date", "vendor", "category", "total_amount"},
+		PropertyOrdering: []string{
+			"raw_date", "date", "vendor", "category", "total_amount",
+			"patient_name", "is_treatment", "is_medicine", "is_nursing_care", "is_other_medical", "reimbursed_amount",
+		},
+		Required: []string{
+			"raw_date", "date", "vendor", "category", "total_amount",
+			"patient_name", "is_treatment", "is_medicine", "is_nursing_care", "is_other_medical", "reimbursed_amount",
+		},
 	},
 }
 
@@ -402,9 +439,15 @@ Today's date is %s (Year %d = Reiwa %d / 令和%d年).
 Extract JSON with these keys:
     "raw_date" (exact date string printed on the receipt, e.g. "令和%d年10月18日", "令%d.10.18", "R%d/10/18"),
     "date" (YYYY-MM-DD),
-    "vendor" (Japanese name, if medical use clinic name),
+    "vendor" (Japanese name, if medical use clinic or pharmacy name),
     "category" (Medical, Grocery, Tax, Utilities, Septic, Other),
-    "total_amount" (integer).
+    "total_amount" (integer amount paid in JPY),
+    "patient_name" (for Medical: patient full name 医療を受けた人 printed on the receipt, without honorifics like 様; empty string if not printed or not Medical),
+    "is_treatment" (boolean, NTA 診療・治療: true for hospital/clinic/dental treatment),
+    "is_medicine" (boolean, NTA 医薬品購入: true for dispensing pharmacy 調剤薬局 or drugstore medicine purchase),
+    "is_nursing_care" (boolean, NTA 介護保険サービス: true for nursing care insurance service),
+    "is_other_medical" (boolean, NTA その他の医療費: true for other qualifying medical expenses),
+    "reimbursed_amount" (integer, NTA 左のうち、補填される金額: insurance/municipal reimbursement amount if explicitly stated on receipt, else 0).
 
 Japanese Era (Wareki) Conversion Rules:
 - Reiwa (令和 / 令 / R): Year = 2018 + N (Reiwa 1/元年 = 2019, Reiwa 6 = 2024, Reiwa 7 = 2025, Reiwa 8 / 令和8年 / 令8 / R8 = 2026).
@@ -499,12 +542,17 @@ func saveAndArchive(srcPath string, dataList []ReceiptData) {
 	successCount := 0
 	for _, data := range uniqueList {
 		resolvedDate := resolveReceiptDate(data)
+		dateInfo := fmt.Sprintf("raw_date=%q -> date=%s", data.RawDate, resolvedDate)
 		if data.RawDate != "" && data.Date != "" && resolvedDate != data.Date {
-			log.Printf("Extracted receipt: raw_date=%q (llm_date=%q -> resolved=%s), vendor=%q, category=%q, amount=%d円",
-				data.RawDate, data.Date, resolvedDate, data.Vendor, data.Category, data.Amount)
+			dateInfo = fmt.Sprintf("raw_date=%q (llm_date=%q -> resolved=%s)", data.RawDate, data.Date, resolvedDate)
+		}
+		if sanitizeCategory(data.Category) == "Medical" {
+			log.Printf("Extracted receipt: %s, patient=%q, vendor=%q, category=%q, amount=%d円 (treatment=%t, medicine=%t, nursing=%t, other=%t, reimbursed=%d円)",
+				dateInfo, sanitizePatientName(data.PatientName), data.Vendor, data.Category, data.Amount,
+				data.IsTreatment, data.IsMedicine, data.IsNursingCare, data.IsOtherMedical, data.ReimbursedAmount)
 		} else {
-			log.Printf("Extracted receipt: raw_date=%q -> date=%s, vendor=%q, category=%q, amount=%d円",
-				data.RawDate, resolvedDate, data.Vendor, data.Category, data.Amount)
+			log.Printf("Extracted receipt: %s, vendor=%q, category=%q, amount=%d円",
+				dateInfo, data.Vendor, data.Category, data.Amount)
 		}
 		if err := saveProcessedFile(srcPath, data); err != nil {
 			log.Printf("Failed to save processed file: %v", err)
@@ -548,6 +596,21 @@ func sanitizeVendor(vendor string) string {
 		return "Unknown"
 	}
 	return res
+}
+
+// sanitizePatientName cleans control characters and trailing honorifics (e.g. 様) from a patient name
+func sanitizePatientName(name string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, name)
+	cleaned = strings.TrimSpace(cleaned)
+	for _, suffix := range []string{"様", "殿", "さん"} {
+		cleaned = strings.TrimSpace(strings.TrimSuffix(cleaned, suffix))
+	}
+	return cleaned
 }
 
 var (
@@ -687,18 +750,203 @@ func uniquePath(path string) string {
 	}
 }
 
+// yamlString safely formats a scalar string for YAML, quoting only when necessary
+func yamlString(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return `""`
+	}
+	needsQuote := false
+	for i, r := range s {
+		if unicode.IsControl(r) {
+			needsQuote = true
+			break
+		}
+		switch r {
+		case ':', '#', '"', '\'', '{', '}', '[', ']', ',', '&', '*', '?', '|', '>', '%', '@', '`', '!':
+			needsQuote = true
+		}
+		if i == 0 && (r == '-' || r == ' ') {
+			needsQuote = true
+		}
+	}
+	if needsQuote {
+		escaped := strings.ReplaceAll(s, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+		return `"` + escaped + `"`
+	}
+	return s
+}
+
+// ntaFlag converts a boolean into the NTA 医療費集計フォーム dropdown value ("該当する" or "")
+func ntaFlag(b bool) string {
+	if b {
+		return "該当する"
+	}
+	return ""
+}
+
+// formatMedicalYAML serializes ReceiptData and NTA 医療費集計フォーム Ver.3.1 fields as clean YAML
+func formatMedicalYAML(data ReceiptData, resolvedDate string) string {
+	patient := sanitizePatientName(data.PatientName)
+	provider := strings.TrimSpace(data.Vendor)
+	if provider == "" {
+		provider = sanitizeVendor(data.Vendor)
+	}
+
+	isTreatment := data.IsTreatment
+	isMedicine := data.IsMedicine
+	isNursing := data.IsNursingCare
+	isOther := data.IsOtherMedical
+
+	// Default to treatment or medicine if Gemini left all 4 false on a Medical receipt
+	if !isTreatment && !isMedicine && !isNursing && !isOther {
+		if strings.Contains(provider, "薬局") || strings.Contains(provider, "ドラッグ") || strings.Contains(provider, "ファーマシー") {
+			isMedicine = true
+		} else {
+			isTreatment = true
+		}
+	}
+
+	reimbursed := data.ReimbursedAmount
+	if reimbursed < 0 {
+		reimbursed = 0
+	}
+	slashDate := strings.ReplaceAll(resolvedDate, "-", "/")
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "date: %s\n", yamlString(resolvedDate))
+	fmt.Fprintf(&b, "raw_date: %s\n", yamlString(data.RawDate))
+	fmt.Fprintf(&b, "vendor: %s\n", yamlString(provider))
+	fmt.Fprintf(&b, "category: Medical\n")
+	fmt.Fprintf(&b, "total_amount: %d\n", data.Amount)
+	fmt.Fprintf(&b, "nta_medical:\n")
+	fmt.Fprintf(&b, "  patient_name: %s\n", yamlString(patient))
+	fmt.Fprintf(&b, "  provider_name: %s\n", yamlString(provider))
+	fmt.Fprintf(&b, "  classification:\n")
+	fmt.Fprintf(&b, "    treatment: %t\n", isTreatment)
+	fmt.Fprintf(&b, "    medicine: %t\n", isMedicine)
+	fmt.Fprintf(&b, "    nursing_care: %t\n", isNursing)
+	fmt.Fprintf(&b, "    other_medical: %t\n", isOther)
+	fmt.Fprintf(&b, "  amount_paid: %d\n", data.Amount)
+	fmt.Fprintf(&b, "  amount_reimbursed: %d\n", reimbursed)
+	fmt.Fprintf(&b, "  payment_date: %s\n", yamlString(slashDate))
+	fmt.Fprintf(&b, "  form_columns:\n")
+	fmt.Fprintf(&b, "    医療を受けた人: %s\n", yamlString(patient))
+	fmt.Fprintf(&b, "    病院・薬局などの名称: %s\n", yamlString(provider))
+	fmt.Fprintf(&b, "    診療・治療: %s\n", yamlString(ntaFlag(isTreatment)))
+	fmt.Fprintf(&b, "    医薬品購入: %s\n", yamlString(ntaFlag(isMedicine)))
+	fmt.Fprintf(&b, "    介護保険サービス: %s\n", yamlString(ntaFlag(isNursing)))
+	fmt.Fprintf(&b, "    その他の医療費: %s\n", yamlString(ntaFlag(isOther)))
+	fmt.Fprintf(&b, "    支払った医療費の金額: %d\n", data.Amount)
+	fmt.Fprintf(&b, "    補填される金額: %d\n", reimbursed)
+	fmt.Fprintf(&b, "    支払年月日: %s\n", yamlString(slashDate))
+	return b.String()
+}
+
+// writeMedicalZip bundles the original scan file and its companion YAML metadata into a single .zip archive
+func writeMedicalZip(srcPath, zipPath string, data ReceiptData, resolvedDate string) error {
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	zipFile, err := os.OpenFile(zipPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+
+	zw := zip.NewWriter(zipFile)
+	stem := strings.TrimSuffix(filepath.Base(zipPath), filepath.Ext(zipPath))
+	now := time.Now()
+
+	// 1. Add the original scan file (<stem>.pdf / .jpg / .png)
+	scanEntryName := stem + filepath.Ext(srcPath)
+	scanHeader, err := zip.FileInfoHeader(srcInfo)
+	if err != nil {
+		_ = zw.Close()
+		_ = zipFile.Close()
+		_ = os.Remove(zipPath)
+		return err
+	}
+	scanHeader.Name = scanEntryName
+	scanHeader.Method = zip.Deflate
+	scanHeader.Modified = now
+
+	scanWriter, err := zw.CreateHeader(scanHeader)
+	if err != nil {
+		_ = zw.Close()
+		_ = zipFile.Close()
+		_ = os.Remove(zipPath)
+		return err
+	}
+	if _, err := io.Copy(scanWriter, srcFile); err != nil {
+		_ = zw.Close()
+		_ = zipFile.Close()
+		_ = os.Remove(zipPath)
+		return err
+	}
+
+	// 2. Add the companion YAML file (<stem>.yaml)
+	yamlHeader := &zip.FileHeader{
+		Name:     stem + ".yaml",
+		Method:   zip.Deflate,
+		Modified: now,
+	}
+	yamlHeader.SetMode(0644)
+	yamlWriter, err := zw.CreateHeader(yamlHeader)
+	if err != nil {
+		_ = zw.Close()
+		_ = zipFile.Close()
+		_ = os.Remove(zipPath)
+		return err
+	}
+	if _, err := io.WriteString(yamlWriter, formatMedicalYAML(data, resolvedDate)); err != nil {
+		_ = zw.Close()
+		_ = zipFile.Close()
+		_ = os.Remove(zipPath)
+		return err
+	}
+
+	if err := zw.Close(); err != nil {
+		_ = zipFile.Close()
+		_ = os.Remove(zipPath)
+		return err
+	}
+	if err := zipFile.Close(); err != nil {
+		_ = os.Remove(zipPath)
+		return err
+	}
+	return nil
+}
+
 func saveProcessedFile(srcPath string, data ReceiptData) error {
 	vendor := sanitizeVendor(data.Vendor)
 	date := resolveReceiptDate(data)
 	category := sanitizeCategory(data.Category)
 
-	processedFileName := fmt.Sprintf("%s_%s_%d円%s", date, vendor, data.Amount, filepath.Ext(srcPath))
 	processedDir := filepath.Join(destDir, category)
-
 	if err := os.MkdirAll(processedDir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", processedDir, err)
 	}
 
+	if category == "Medical" {
+		zipFileName := fmt.Sprintf("%s_%s_%d円.zip", date, vendor, data.Amount)
+		processedPath := uniquePath(filepath.Join(processedDir, zipFileName))
+		if err := writeMedicalZip(srcPath, processedPath, data, date); err != nil {
+			return fmt.Errorf("failed to write medical zip archive: %w", err)
+		}
+		log.Printf("Saved processed file: %s", processedPath)
+		return nil
+	}
+
+	processedFileName := fmt.Sprintf("%s_%s_%d円%s", date, vendor, data.Amount, filepath.Ext(srcPath))
 	processedPath := uniquePath(filepath.Join(processedDir, processedFileName))
 
 	if err := robustCopy(srcPath, processedPath); err != nil {

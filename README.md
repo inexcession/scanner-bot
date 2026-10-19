@@ -89,13 +89,14 @@ export GEMINI_API_KEY="your_api_key_here"
 
 ## How it Works
 
-1.  **Detect**: The bot watches for `Create`, `Write`, `Rename`, or `Chmod` events in the watch directory.
+1.  **Detect**: The bot watches for `Create`, `Write`, or `Chmod` events in the watch directory.
 2.  **Wait**: It waits for the file size to stabilize (indicating the scanner has finished writing).
 3.  **Analyze**: The file is uploaded to Google Gemini.
-4.  **Extract**: The AI extracts the Date, Vendor, Category, and Total Amount.
+4.  **Extract**: The AI extracts the Date (including Japanese era / Wareki conversion), Vendor, Category, Total Amount, and NTA medical expense fields (`医療費集計フォーム Ver.3.1`).
 5.  **Process**:
-    - The file is copied to `dest/Category/YYYY-MM-DD_Vendor_Amount円.ext`.
-    - The original file is moved to `dest/originals/filename.ext`.
+    - For `Medical` receipts: Bundles the original scan (`<stem>.ext`) and a companion `<stem>.yaml` metadata file (containing all NTA medical form fields) into `dest/Medical/YYYY-MM-DD_Vendor_Amount円.zip`.
+    - For all other categories: Copies the file to `dest/Category/YYYY-MM-DD_Vendor_Amount円.ext`.
+    - Moves the raw original file to `dest/originals/filename.ext`.
 
 ## License
 
