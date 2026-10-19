@@ -5,8 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/genai"
 )
 
 func TestParseGeminiResponse(t *testing.T) {
@@ -117,6 +120,40 @@ func TestSanitization(t *testing.T) {
 	today := time.Now().Format("2006-01-02")
 	if got := sanitizeDate("not-a-date"); got != today {
 		t.Errorf("sanitizeDate(invalid) = %q, want %q", got, today)
+	}
+
+	warekiTests := []struct {
+		input string
+		want  string
+	}{
+		{"令和8年10月18日", "2026-10-18"},
+		{"令和 8 年 10 月 2 日", "2026-10-02"},
+		{"令和８年１０月１５日", "2026-10-15"},
+		{"令8.10.18", "2026-10-18"},
+		{"R8/10/18", "2026-10-18"},
+		{"r8-10-2", "2026-10-02"},
+		{"令和元年5月1日", "2019-05-01"},
+		{"平成31年4月30日", "2019-04-30"},
+		{"8.10.18", "2026-10-18"},
+		{"2026年10月18日", "2026-10-18"},
+		{"2026/10/2", "2026-10-02"},
+	}
+	for _, tc := range warekiTests {
+		if got := sanitizeDate(tc.input); got != tc.want {
+			t.Errorf("sanitizeDate(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+
+	// Verify RawDate overrides an LLM miscalculated Gregorian year (e.g. 2024 instead of 2026 for Reiwa 8)
+	misconverted := ReceiptData{
+		RawDate:  "令和8年10月2日",
+		Date:     "2024-10-02",
+		Vendor:   "医療法人社団CVIC大井町心臓クリニック",
+		Category: "Medical",
+		Amount:   1850,
+	}
+	if got := resolveReceiptDate(misconverted); got != "2026-10-02" {
+		t.Errorf("resolveReceiptDate() = %q, want 2026-10-02", got)
 	}
 }
 
@@ -240,4 +277,24 @@ func TestEnqueueFileIgnoresMissingOrDirectory(t *testing.T) {
 		t.Errorf("expected missing file %s not to be stored in activeFiles", missingPath)
 	}
 }
+
+func TestFormatUsageStats(t *testing.T) {
+	resp := &genai.GenerateContentResponse{
+		ModelVersion: "gemini-2.5-flash-preview-09-2025",
+		UsageMetadata: &genai.GenerateContentResponseUsageMetadata{
+			PromptTokenCount:     310,
+			CandidatesTokenCount: 45,
+			ThoughtsTokenCount:   120,
+			TotalTokenCount:      475,
+		},
+	}
+
+	got := formatUsageStats(resp, 4123*time.Millisecond)
+	for _, wantSub := range []string{"model=gemini-2.5-flash-preview-09-2025", "latency=4.123s", "prompt=310", "candidates=45", "thoughts=120", "total=475"} {
+		if !strings.Contains(got, wantSub) {
+			t.Errorf("formatUsageStats() = %q, missing %q", got, wantSub)
+		}
+	}
+}
+
 

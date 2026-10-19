@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,7 +25,7 @@ import (
 )
 
 // --- CONFIGURATION ---
-const Version = "v1.03"
+const Version = "v1.04"
 
 var (
 	// Configurable paths via flags
@@ -44,6 +46,7 @@ var (
 
 // ReceiptData maps the JSON response from Gemini
 type ReceiptData struct {
+	RawDate  string `json:"raw_date"`
 	Date     string `json:"date"`
 	Vendor   string `json:"vendor"`
 	Category string `json:"category"`
@@ -68,9 +71,13 @@ var receiptResponseSchema = &genai.Schema{
 	Items: &genai.Schema{
 		Type: genai.TypeObject,
 		Properties: map[string]*genai.Schema{
+			"raw_date": {
+				Type:        genai.TypeString,
+				Description: "Exact date text as printed on the receipt (e.g. '令和8年10月18日', '令8.10.18', 'R8/10/18', '2026年10月18日')",
+			},
 			"date": {
 				Type:        genai.TypeString,
-				Description: "Receipt date in YYYY-MM-DD format",
+				Description: "Receipt date converted to YYYY-MM-DD format (Reiwa N = 2018 + N, so Reiwa 8 / 令和8年 = 2026)",
 			},
 			"vendor": {
 				Type:        genai.TypeString,
@@ -87,7 +94,8 @@ var receiptResponseSchema = &genai.Schema{
 				Description: "Total amount in JPY as an integer",
 			},
 		},
-		Required: []string{"date", "vendor", "category", "total_amount"},
+		PropertyOrdering: []string{"raw_date", "date", "vendor", "category", "total_amount"},
+		Required:         []string{"raw_date", "date", "vendor", "category", "total_amount"},
 	},
 }
 
@@ -163,7 +171,7 @@ func main() {
 				// Trigger on file creation or modification (exclude Rename/Remove which fire when archiving out of watchDir)
 				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Chmod) {
 					enqueueFile(ctx, client, semaphore, &wg, event.Name)
-				} else {
+				} else if !event.Has(fsnotify.Remove) && !event.Has(fsnotify.Rename) {
 					log.Printf("Ignored event: %v", event)
 				}
 
@@ -263,7 +271,11 @@ func processEvent(ctx context.Context, client *genai.Client, path string) {
 		return
 	}
 
-	log.Printf("Processing: %s", path)
+	var sizeBytes int64
+	if info, err := os.Stat(path); err == nil {
+		sizeBytes = info.Size()
+	}
+	log.Printf("Processing: %s (size=%d bytes)", path, sizeBytes)
 
 	dataList, err := analyzeReceipt(ctx, client, path)
 	if err != nil {
@@ -318,9 +330,33 @@ func waitForStableFile(ctx context.Context, path string) error {
 	}
 }
 
+// formatUsageStats formats Gemini response metadata (model version, latency, token counts) for logging
+func formatUsageStats(resp *genai.GenerateContentResponse, elapsed time.Duration) string {
+	modelVer := modelName
+	if resp != nil && resp.ModelVersion != "" {
+		modelVer = resp.ModelVersion
+	}
+	if resp == nil || resp.UsageMetadata == nil {
+		return fmt.Sprintf("model=%s, latency=%s", modelVer, elapsed.Round(time.Millisecond))
+	}
+	u := resp.UsageMetadata
+	if u.ThoughtsTokenCount > 0 {
+		return fmt.Sprintf("model=%s, latency=%s, tokens: prompt=%d candidates=%d thoughts=%d total=%d",
+			modelVer, elapsed.Round(time.Millisecond),
+			u.PromptTokenCount, u.CandidatesTokenCount, u.ThoughtsTokenCount, u.TotalTokenCount)
+	}
+	return fmt.Sprintf("model=%s, latency=%s, tokens: prompt=%d candidates=%d total=%d",
+		modelVer, elapsed.Round(time.Millisecond),
+		u.PromptTokenCount, u.CandidatesTokenCount, u.TotalTokenCount)
+}
+
 // analyzeReceipt uploads the file to Gemini and extracts receipt data
 func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]ReceiptData, error) {
-	// Upload
+	baseName := filepath.Base(path)
+
+	// 1. Upload
+	uploadStart := time.Now()
+	log.Printf("Uploading to Gemini Files API: %s", baseName)
 	upFile, err := client.Files.UploadFromPath(ctx, path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("upload failed: %w", err)
@@ -333,10 +369,17 @@ func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]R
 		}
 	}(upFile.Name)
 
-	// Wait for processing with a bounded timeout
+	log.Printf("Uploaded %s -> %s (mime=%s, state=%s, took=%s)",
+		baseName, upFile.Name, upFile.MIMEType, upFile.State, time.Since(uploadStart).Round(time.Millisecond))
+
+	// 2. Wait for remote file processing with a bounded timeout
 	pollCtx, pollCancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer pollCancel()
 
+	if upFile.State == genai.FileStateProcessing {
+		log.Printf("Waiting for Gemini remote file processing: %s (%s)...", baseName, upFile.Name)
+	}
+	pollStart := time.Now()
 	for upFile.State == genai.FileStateProcessing {
 		select {
 		case <-pollCtx.Done():
@@ -353,14 +396,31 @@ func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]R
 	if upFile.State != genai.FileStateActive {
 		return nil, fmt.Errorf("file processing failed state: %s", upFile.State)
 	}
+	if time.Since(pollStart) >= time.Second {
+		log.Printf("Remote file ready: %s (took=%s)", upFile.Name, time.Since(pollStart).Round(time.Millisecond))
+	}
 
-	// Generate
-	prompt := `Analyze this Japanese receipt or certificate. Extract JSON with these keys:
+	// 3. Generate
+	now := time.Now()
+	currentYear := now.Year()
+	reiwaYear := currentYear - 2018
+
+	prompt := fmt.Sprintf(`Analyze this Japanese receipt or certificate.
+Today's date is %s (Year %d = Reiwa %d / 令和%d年).
+
+Extract JSON with these keys:
+    "raw_date" (exact date string printed on the receipt, e.g. "令和%d年10月18日", "令%d.10.18", "R%d/10/18"),
     "date" (YYYY-MM-DD),
     "vendor" (Japanese name, if medical use clinic name),
     "category" (Medical, Grocery, Tax, Utilities, Septic, Other),
     "total_amount" (integer).
-If the document contains multiple pages for the same receipt/transaction, return only a single entry for that transaction.`
+
+Japanese Era (Wareki) Conversion Rules:
+- Reiwa (令和 / 令 / R): Year = 2018 + N (Reiwa 1/元年 = 2019, Reiwa 6 = 2024, Reiwa 7 = 2025, Reiwa 8 / 令和8年 / 令8 / R8 = 2026).
+- Heisei (平成 / 平 / H): Year = 1988 + N.
+- Read the era year digit carefully on medical receipts (do not confuse 令和%d年 with 令和5年 or 令和6年).
+- If the document contains multiple pages for the same receipt/transaction, return only a single entry for that transaction.`,
+		now.Format("2006-01-02"), currentYear, reiwaYear, reiwaYear, reiwaYear, reiwaYear, reiwaYear, reiwaYear)
 
 	contents := []*genai.Content{
 		genai.NewContentFromParts([]*genai.Part{
@@ -369,13 +429,18 @@ If the document contains multiple pages for the same receipt/transaction, return
 		}, genai.RoleUser),
 	}
 
+	llmStart := time.Now()
+	log.Printf("Sent to LLM (%s), waiting for response: %s...", modelName, baseName)
 	resp, err := client.Models.GenerateContent(ctx, modelName, contents, &genai.GenerateContentConfig{
 		ResponseMIMEType: "application/json",
 		ResponseSchema:   receiptResponseSchema,
 	})
+	llmElapsed := time.Since(llmStart)
 	if err != nil {
-		return nil, fmt.Errorf("gemini generate error: %w", err)
+		return nil, fmt.Errorf("gemini generate error (after %s): %w", llmElapsed.Round(time.Millisecond), err)
 	}
+
+	log.Printf("LLM response received for %s (%s)", baseName, formatUsageStats(resp, llmElapsed))
 
 	jsonText := resp.Text()
 	if jsonText == "" {
@@ -424,7 +489,7 @@ func deduplicateReceipts(dataList []ReceiptData) []ReceiptData {
 	result := make([]ReceiptData, 0, len(dataList))
 	for _, d := range dataList {
 		key := receiptKey{
-			date:     sanitizeDate(d.Date),
+			date:     resolveReceiptDate(d),
 			vendor:   sanitizeVendor(d.Vendor),
 			category: sanitizeCategory(d.Category),
 			amount:   d.Amount,
@@ -442,6 +507,14 @@ func saveAndArchive(srcPath string, dataList []ReceiptData) {
 	uniqueList := deduplicateReceipts(dataList)
 	successCount := 0
 	for _, data := range uniqueList {
+		resolvedDate := resolveReceiptDate(data)
+		if data.RawDate != "" && data.Date != "" && resolvedDate != data.Date {
+			log.Printf("Extracted receipt: raw_date=%q (llm_date=%q -> resolved=%s), vendor=%q, category=%q, amount=%d円",
+				data.RawDate, data.Date, resolvedDate, data.Vendor, data.Category, data.Amount)
+		} else {
+			log.Printf("Extracted receipt: raw_date=%q -> date=%s, vendor=%q, category=%q, amount=%d円",
+				data.RawDate, resolvedDate, data.Vendor, data.Category, data.Amount)
+		}
 		if err := saveProcessedFile(srcPath, data); err != nil {
 			log.Printf("Failed to save processed file: %v", err)
 		} else {
@@ -486,11 +559,124 @@ func sanitizeVendor(vendor string) string {
 	return res
 }
 
-// sanitizeDate ensures the date is in YYYY-MM-DD format, falling back to today's date
+var (
+	// Matches Japanese era dates such as 令和8年10月18日, 令8.10.18, R8/10/18, 令和元年5月1日, 平成31年4月30日
+	warekiRegex = regexp.MustCompile(`(?i)(令和|令|R|平成|平|H|昭和|昭|S)\s*(元|\d{1,2})\s*(?:年|[./\-])\s*(\d{1,2})\s*(?:月|[./\-])\s*(\d{1,2})\s*日?`)
+	// Matches Gregorian dates such as 2026-10-18, 2026/10/18, 2026.10.18, 2026年10月18日
+	gregorianRegex = regexp.MustCompile(`(\d{4})\s*(?:年|[./\-])\s*(\d{1,2})\s*(?:月|[./\-])\s*(\d{1,2})\s*日?`)
+	// Matches compact 2-digit year or Reiwa year dates such as 26.10.18 or 8.10.18 when preceded/used as full date string
+	shortYearDateRegex = regexp.MustCompile(`^\s*(\d{1,2})\s*(?:年|[./\-])\s*(\d{1,2})\s*(?:月|[./\-])\s*(\d{1,2})\s*日?\s*$`)
+)
+
+// normalizeFullWidth converts full-width ASCII digits and punctuation (e.g. ０-９, ／, ．) to standard ASCII
+func normalizeFullWidth(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= '０' && r <= '９':
+			b.WriteRune('0' + (r - '０'))
+		case r >= 'Ａ' && r <= 'Ｚ':
+			b.WriteRune('A' + (r - 'Ａ'))
+		case r >= 'ａ' && r <= 'ｚ':
+			b.WriteRune('a' + (r - 'ａ'))
+		case r == '／':
+			b.WriteRune('/')
+		case r == '．' || r == '。':
+			b.WriteRune('.')
+		case r == '－' || r == 'ー' || r == '―':
+			b.WriteRune('-')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// parseJapaneseDate attempts to parse Japanese era (Wareki) or Gregorian date strings into YYYY-MM-DD
+func parseJapaneseDate(raw string) (string, bool) {
+	norm := strings.TrimSpace(normalizeFullWidth(raw))
+	if norm == "" {
+		return "", false
+	}
+
+	// 1. Check explicit Japanese era (令和 / 令 / R, 平成 / 平 / H, 昭和 / 昭 / S)
+	if m := warekiRegex.FindStringSubmatch(norm); m != nil {
+		era := strings.ToUpper(m[1])
+		eraYear := 1
+		if m[2] != "元" {
+			y, err := strconv.Atoi(m[2])
+			if err != nil || y < 1 {
+				return "", false
+			}
+			eraYear = y
+		}
+		month, _ := strconv.Atoi(m[3])
+		day, _ := strconv.Atoi(m[4])
+
+		var baseYear int
+		switch era {
+		case "令和", "令", "R":
+			baseYear = 2018
+		case "平成", "平", "H":
+			baseYear = 1988
+		case "昭和", "昭", "S":
+			baseYear = 1925
+		default:
+			return "", false
+		}
+
+		candidate := fmt.Sprintf("%04d-%02d-%02d", baseYear+eraYear, month, day)
+		if _, err := time.Parse("2006-01-02", candidate); err == nil {
+			return candidate, true
+		}
+	}
+
+	// 2. Check 4-digit Gregorian date (YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, YYYY年M月D日)
+	if m := gregorianRegex.FindStringSubmatch(norm); m != nil {
+		year, _ := strconv.Atoi(m[1])
+		month, _ := strconv.Atoi(m[2])
+		day, _ := strconv.Atoi(m[3])
+		candidate := fmt.Sprintf("%04d-%02d-%02d", year, month, day)
+		if _, err := time.Parse("2006-01-02", candidate); err == nil {
+			return candidate, true
+		}
+	}
+
+	// 3. Check bare short-year date (e.g. "8.10.18" -> Reiwa 8 = 2026, or "26.10.18" -> 2026)
+	if m := shortYearDateRegex.FindStringSubmatch(norm); m != nil {
+		y, _ := strconv.Atoi(m[1])
+		month, _ := strconv.Atoi(m[2])
+		day, _ := strconv.Atoi(m[3])
+		var year int
+		if y >= 1 && y <= 15 {
+			year = 2018 + y // Reiwa year
+		} else if y >= 20 && y <= 99 {
+			year = 2000 + y // 2-digit Gregorian year
+		}
+		if year > 0 {
+			candidate := fmt.Sprintf("%04d-%02d-%02d", year, month, day)
+			if _, err := time.Parse("2006-01-02", candidate); err == nil {
+				return candidate, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+// resolveReceiptDate prefers deterministic parsing of RawDate (especially Japanese era dates) before falling back to Date
+func resolveReceiptDate(data ReceiptData) string {
+	if parsed, ok := parseJapaneseDate(data.RawDate); ok {
+		return parsed
+	}
+	return sanitizeDate(data.Date)
+}
+
+// sanitizeDate ensures the date is in YYYY-MM-DD format, supporting Japanese eras and falling back to today's date
 func sanitizeDate(dateStr string) string {
-	trimmed := strings.TrimSpace(dateStr)
-	if _, err := time.Parse("2006-01-02", trimmed); err == nil {
-		return trimmed
+	if parsed, ok := parseJapaneseDate(dateStr); ok {
+		return parsed
 	}
 	return time.Now().Format("2006-01-02")
 }
@@ -512,7 +698,7 @@ func uniquePath(path string) string {
 
 func saveProcessedFile(srcPath string, data ReceiptData) error {
 	vendor := sanitizeVendor(data.Vendor)
-	date := sanitizeDate(data.Date)
+	date := resolveReceiptDate(data)
 	category := sanitizeCategory(data.Category)
 
 	processedFileName := fmt.Sprintf("%s_%s_%d円%s", date, vendor, data.Amount, filepath.Ext(srcPath))
