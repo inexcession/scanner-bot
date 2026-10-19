@@ -56,7 +56,7 @@ It works :D
     [Service]
     User=your_user
     Environment="GEMINI_API_KEY=your_api_key_here"
-    ExecStart=/path/to/scanner-bot -watch "/path/to/input" -dest "/path/to/output" -workers 2 -syslog=true
+    ExecStart=/path/to/scanner-bot -watch "/path/to/input" -dest "/path/to/output" -workers 2
     ```
 
     Then copy it to systemd and enable it:
@@ -66,7 +66,7 @@ It works :D
     sudo systemctl enable --now scanner-bot
     ```
 
-    To view the logs (which are routed to syslog by default), use journalctl:
+    To view the logs, use journalctl:
     ```bash
     sudo journalctl -u scanner-bot -f
     ```
@@ -85,7 +85,6 @@ export GEMINI_API_KEY="your_api_key_here"
 - `-watch`: (Required) The directory to watch for new incoming scan files.
 - `-dest`: (Required) The root directory where processed files and the `originals` folder will be created.
 - `-model`: The Gemini model to use (default: "gemini-flash-latest").
-- `-syslog`: Enable logging to the system's syslog daemon (default: true).
 - `-workers`: Maximum number of concurrent files to process, to prevent Gemini API rate limits (default: 2).
 
 ## How it Works

@@ -13,7 +13,7 @@ Environment="GEMINI_API_KEY=YOUR_API_KEY_HERE"
 
 # --- EXECUTION ---
 # You must explicitly set the -watch and -dest flags.
-# Optional flags: -model "gemini-flash-latest", -syslog (default true), -workers (default 2)
+# Optional flags: -model "gemini-flash-latest", -workers (default 2)
 ExecStart=/path/to/scanner_bot -watch /path/to/scanner_in -dest /path/to/documents_out -workers 2
 
 Restart=always

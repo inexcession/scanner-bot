@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"log/syslog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,7 +24,7 @@ import (
 )
 
 // --- CONFIGURATION ---
-const Version = "v1.04"
+const Version = "v1.05"
 
 var (
 	// Configurable paths via flags
@@ -34,7 +33,6 @@ var (
 
 	// Other configurations
 	modelName        string
-	useSyslog        bool
 	concurrencyLimit int
 
 	// File stability timings (variables to allow fast overrides in tests)
@@ -107,19 +105,12 @@ func main() {
 	flag.StringVar(&watchDir, "watch", "", "Directory to watch for new receipts (required)")
 	flag.StringVar(&destDir, "dest", "", "Directory to save processed receipts (required)")
 	flag.StringVar(&modelName, "model", "gemini-flash-latest", "Gemini model to use")
-	flag.BoolVar(&useSyslog, "syslog", true, "Enable syslog output")
 	flag.IntVar(&concurrencyLimit, "workers", 2, "Number of concurrent processing workers")
 	flag.Parse()
 
-	if useSyslog {
-		syslogger, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "scanner-bot")
-		if err == nil {
-			log.SetOutput(syslogger)
-			log.SetFlags(0)
-		} else {
-			log.Printf("Failed to connect to syslog: %v", err)
-		}
-	}
+	// Disable standard Go log timestamp prefix since service supervisors (runit/vlogger/systemd) add their own timestamps
+	log.SetFlags(0)
+	log.SetOutput(os.Stdout)
 
 	if watchDir == "" || destDir == "" {
 		flag.Usage()
