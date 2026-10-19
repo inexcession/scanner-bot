@@ -23,7 +23,7 @@ import (
 )
 
 // --- CONFIGURATION ---
-const Version = "v1.02"
+const Version = "v1.03"
 
 var (
 	// Configurable paths via flags
@@ -36,9 +36,10 @@ var (
 	concurrencyLimit int
 
 	// File stability timings (variables to allow fast overrides in tests)
-	stabilityThreshold = 10 * time.Second
-	stabilityPollWait  = 1 * time.Second
-	maxStabilityWait   = 5 * time.Minute
+	stabilityThreshold     = 10 * time.Second
+	stabilityPollWait      = 1 * time.Second
+	maxStabilityWait       = 5 * time.Minute
+	activeFileCleanupDelay = 2 * time.Second
 )
 
 // ReceiptData maps the JSON response from Gemini
@@ -159,8 +160,8 @@ func main() {
 					return
 				}
 
-				// Trigger on any modification that might indicate a file is ready
-				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) || event.Has(fsnotify.Chmod) {
+				// Trigger on file creation or modification (exclude Rename/Remove which fire when archiving out of watchDir)
+				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Chmod) {
 					enqueueFile(ctx, client, semaphore, &wg, event.Name)
 				} else {
 					log.Printf("Ignored event: %v", event)
@@ -217,7 +218,12 @@ func scanExistingFiles(ctx context.Context, client *genai.Client, semaphore chan
 
 // enqueueFile filters and deduplicates a file path before dispatching a worker goroutine
 func enqueueFile(ctx context.Context, client *genai.Client, semaphore chan struct{}, wg *sync.WaitGroup, path string) {
+	path = filepath.Clean(path)
 	if !isSupportedReceiptFile(path) {
+		return
+	}
+	// Verify file still exists before enqueuing (guards against trailing events after archive/removal)
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
 		return
 	}
 	// DEDUPLICATION: Check if we are already handling this file
@@ -228,7 +234,15 @@ func enqueueFile(ctx context.Context, client *genai.Client, semaphore chan struc
 	wg.Add(1)
 	go func(p string) {
 		defer wg.Done()
-		defer activeFiles.Delete(p)
+		defer func() {
+			if activeFileCleanupDelay > 0 {
+				time.AfterFunc(activeFileCleanupDelay, func() {
+					activeFiles.Delete(p)
+				})
+			} else {
+				activeFiles.Delete(p)
+			}
+		}()
 
 		select {
 		case semaphore <- struct{}{}:
@@ -345,7 +359,8 @@ func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]R
     "date" (YYYY-MM-DD),
     "vendor" (Japanese name, if medical use clinic name),
     "category" (Medical, Grocery, Tax, Utilities, Septic, Other),
-    "total_amount" (integer).`
+    "total_amount" (integer).
+If the document contains multiple pages for the same receipt/transaction, return only a single entry for that transaction.`
 
 	contents := []*genai.Content{
 		genai.NewContentFromParts([]*genai.Part{
@@ -397,9 +412,36 @@ func parseGeminiResponse(jsonText string) ([]ReceiptData, error) {
 	return nil, fmt.Errorf("failed to parse JSON as object or array")
 }
 
+// deduplicateReceipts removes duplicate receipt entries that normalize to the same date, vendor, category, and amount
+func deduplicateReceipts(dataList []ReceiptData) []ReceiptData {
+	type receiptKey struct {
+		date     string
+		vendor   string
+		category string
+		amount   int
+	}
+	seen := make(map[receiptKey]struct{}, len(dataList))
+	result := make([]ReceiptData, 0, len(dataList))
+	for _, d := range dataList {
+		key := receiptKey{
+			date:     sanitizeDate(d.Date),
+			vendor:   sanitizeVendor(d.Vendor),
+			category: sanitizeCategory(d.Category),
+			amount:   d.Amount,
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, d)
+	}
+	return result
+}
+
 func saveAndArchive(srcPath string, dataList []ReceiptData) {
+	uniqueList := deduplicateReceipts(dataList)
 	successCount := 0
-	for _, data := range dataList {
+	for _, data := range uniqueList {
 		if err := saveProcessedFile(srcPath, data); err != nil {
 			log.Printf("Failed to save processed file: %v", err)
 		} else {
