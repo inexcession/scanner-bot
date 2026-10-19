@@ -25,7 +25,7 @@ import (
 )
 
 // --- CONFIGURATION ---
-const Version = "v1.06"
+const Version = "v1.07"
 
 var (
 	// Configurable paths via flags
@@ -45,17 +45,19 @@ var (
 
 // ReceiptData maps the JSON response from Gemini
 type ReceiptData struct {
-	RawDate           string `json:"raw_date"`
-	Date              string `json:"date"`
-	Vendor            string `json:"vendor"`
-	Category          string `json:"category"`
-	Amount            int    `json:"total_amount"`
-	PatientName       string `json:"patient_name,omitempty"`
-	IsTreatment       bool   `json:"is_treatment,omitempty"`
-	IsMedicine        bool   `json:"is_medicine,omitempty"`
-	IsNursingCare     bool   `json:"is_nursing_care,omitempty"`
-	IsOtherMedical    bool   `json:"is_other_medical,omitempty"`
-	ReimbursedAmount  int    `json:"reimbursed_amount,omitempty"`
+	RawDate            string `json:"raw_date"`
+	Date               string `json:"date"`
+	Vendor             string `json:"vendor"`
+	Category           string `json:"category"`
+	Amount             int    `json:"total_amount"`
+	InsuredCopayAmount int    `json:"insured_copay_amount,omitempty"`
+	UninsuredAmount    int    `json:"uninsured_amount,omitempty"`
+	PatientName        string `json:"patient_name,omitempty"`
+	IsTreatment        bool   `json:"is_treatment,omitempty"`
+	IsMedicine         bool   `json:"is_medicine,omitempty"`
+	IsNursingCare      bool   `json:"is_nursing_care,omitempty"`
+	IsOtherMedical     bool   `json:"is_other_medical,omitempty"`
+	ReimbursedAmount   int    `json:"reimbursed_amount,omitempty"`
 }
 
 // Allowed receipt categories
@@ -96,7 +98,15 @@ var receiptResponseSchema = &genai.Schema{
 			},
 			"total_amount": {
 				Type:        genai.TypeInteger,
-				Description: "Total amount paid in JPY as an integer",
+				Description: "Total receipt amount paid in JPY (領収額合計) as an integer",
+			},
+			"insured_copay_amount": {
+				Type:        genai.TypeInteger,
+				Description: "For Medical receipts: health-insurance-covered patient copay amount in JPY (保険負担額) if broken down on the receipt; otherwise equal to total_amount (or 0 if non-medical).",
+			},
+			"uninsured_amount": {
+				Type:        genai.TypeInteger,
+				Description: "For Medical receipts: out-of-insurance / self-pay amount in JPY (保険外負担合計) if broken down on the receipt; otherwise 0.",
 			},
 			"patient_name": {
 				Type:        genai.TypeString,
@@ -125,10 +135,12 @@ var receiptResponseSchema = &genai.Schema{
 		},
 		PropertyOrdering: []string{
 			"raw_date", "date", "vendor", "category", "total_amount",
+			"insured_copay_amount", "uninsured_amount",
 			"patient_name", "is_treatment", "is_medicine", "is_nursing_care", "is_other_medical", "reimbursed_amount",
 		},
 		Required: []string{
 			"raw_date", "date", "vendor", "category", "total_amount",
+			"insured_copay_amount", "uninsured_amount",
 			"patient_name", "is_treatment", "is_medicine", "is_nursing_care", "is_other_medical", "reimbursed_amount",
 		},
 	},
@@ -441,7 +453,9 @@ Extract JSON with these keys:
     "date" (YYYY-MM-DD),
     "vendor" (Japanese name, if medical use clinic or pharmacy name),
     "category" (Medical, Grocery, Tax, Utilities, Septic, Other),
-    "total_amount" (integer amount paid in JPY),
+    "total_amount" (integer total receipt amount paid 領収額合計 in JPY),
+    "insured_copay_amount" (integer, for Medical: health-insurance-covered patient copay 保険負担額 in JPY if listed separately; otherwise equal to total_amount),
+    "uninsured_amount" (integer, for Medical: out-of-insurance amount 保険外負担合計 in JPY if listed separately; otherwise 0),
     "patient_name" (for Medical: patient full name 医療を受けた人 printed on the receipt, without honorifics like 様; empty string if not printed or not Medical),
     "is_treatment" (boolean, NTA 診療・治療: true for hospital/clinic/dental treatment),
     "is_medicine" (boolean, NTA 医薬品購入: true for dispensing pharmacy 調剤薬局 or drugstore medicine purchase),
@@ -547,8 +561,9 @@ func saveAndArchive(srcPath string, dataList []ReceiptData) {
 			dateInfo = fmt.Sprintf("raw_date=%q (llm_date=%q -> resolved=%s)", data.RawDate, data.Date, resolvedDate)
 		}
 		if sanitizeCategory(data.Category) == "Medical" {
-			log.Printf("Extracted receipt: %s, patient=%q, vendor=%q, category=%q, amount=%d円 (treatment=%t, medicine=%t, nursing=%t, other=%t, reimbursed=%d円)",
+			log.Printf("Extracted receipt: %s, patient=%q, vendor=%q, category=%q, amount=%d円 (insured=%d円, uninsured=%d円, treatment=%t, medicine=%t, nursing=%t, other=%t, reimbursed=%d円)",
 				dateInfo, sanitizePatientName(data.PatientName), data.Vendor, data.Category, data.Amount,
+				data.InsuredCopayAmount, data.UninsuredAmount,
 				data.IsTreatment, data.IsMedicine, data.IsNursingCare, data.IsOtherMedical, data.ReimbursedAmount)
 		} else {
 			log.Printf("Extracted receipt: %s, vendor=%q, category=%q, amount=%d円",
@@ -611,6 +626,91 @@ func sanitizePatientName(name string) string {
 		cleaned = strings.TrimSpace(strings.TrimSuffix(cleaned, suffix))
 	}
 	return cleaned
+}
+
+// toFullWidth converts ASCII spaces, digits, and letters to full-width (全角) for NTA Excel form columns
+func toFullWidth(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	lastWasSpace := false
+	for _, r := range strings.TrimSpace(s) {
+		if unicode.IsSpace(r) {
+			if !lastWasSpace {
+				b.WriteRune('　') // U+3000 Ideographic Space
+				lastWasSpace = true
+			}
+			continue
+		}
+		lastWasSpace = false
+		switch {
+		case r >= '!' && r <= '~':
+			b.WriteRune(r + 0xFEE0)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// truncateRunes caps a string to at most maxRunes characters
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes])
+}
+
+// formatNTAPatient formats a patient name for NTA Column B (全角10文字以内)
+func formatNTAPatient(name string) string {
+	fw := toFullWidth(sanitizePatientName(name))
+	if len([]rune(fw)) > 10 {
+		// Try removing full-width space if name is slightly over 10 chars
+		compact := strings.ReplaceAll(fw, "　", "")
+		if len([]rune(compact)) <= 10 {
+			return compact
+		}
+		return truncateRunes(compact, 10)
+	}
+	return fw
+}
+
+// formatNTAProvider formats a hospital/pharmacy name for NTA Column C (全角20文字以内)
+func formatNTAProvider(provider string) string {
+	fw := toFullWidth(provider)
+	if len([]rune(fw)) <= 20 {
+		return fw
+	}
+	// Strip common corporate prefixes when exceeding 20 characters (matching typical NTA form practice)
+	for _, prefix := range []string{
+		"独立行政法人国立病院機構",
+		"地方独立行政法人",
+		"社会医療法人社団",
+		"社会医療法人財団",
+		"社会医療法人",
+		"医療法人社団",
+		"医療法人財団",
+		"医療法人",
+		"株式会社",
+		"有限会社",
+	} {
+		if strings.HasPrefix(fw, prefix) {
+			trimmed := strings.TrimPrefix(fw, prefix)
+			trimmed = strings.TrimLeft(trimmed, "　")
+			if trimmed != "" {
+				fw = trimmed
+				break
+			}
+		}
+	}
+	if len([]rune(fw)) > 20 {
+		compact := strings.ReplaceAll(fw, "　", "")
+		if len([]rune(compact)) <= 20 {
+			return compact
+		}
+		return truncateRunes(compact, 20)
+	}
+	return fw
 }
 
 var (
@@ -808,11 +908,24 @@ func formatMedicalYAML(data ReceiptData, resolvedDate string) string {
 		}
 	}
 
+	insuredCopay := data.InsuredCopayAmount
+	uninsured := data.UninsuredAmount
+	if insuredCopay == 0 && uninsured == 0 && data.Amount > 0 {
+		insuredCopay = data.Amount
+	}
+
 	reimbursed := data.ReimbursedAmount
 	if reimbursed < 0 {
 		reimbursed = 0
 	}
+	reimbursedCol := `""`
+	if reimbursed > 0 {
+		reimbursedCol = strconv.Itoa(reimbursed)
+	}
+
 	slashDate := strings.ReplaceAll(resolvedDate, "-", "/")
+	ntaPatient := formatNTAPatient(patient)
+	ntaProvider := formatNTAProvider(provider)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "date: %s\n", yamlString(resolvedDate))
@@ -829,17 +942,19 @@ func formatMedicalYAML(data ReceiptData, resolvedDate string) string {
 	fmt.Fprintf(&b, "    nursing_care: %t\n", isNursing)
 	fmt.Fprintf(&b, "    other_medical: %t\n", isOther)
 	fmt.Fprintf(&b, "  amount_paid: %d\n", data.Amount)
+	fmt.Fprintf(&b, "  insured_copay_amount: %d\n", insuredCopay)
+	fmt.Fprintf(&b, "  uninsured_amount: %d\n", uninsured)
 	fmt.Fprintf(&b, "  amount_reimbursed: %d\n", reimbursed)
 	fmt.Fprintf(&b, "  payment_date: %s\n", yamlString(slashDate))
 	fmt.Fprintf(&b, "  form_columns:\n")
-	fmt.Fprintf(&b, "    医療を受けた人: %s\n", yamlString(patient))
-	fmt.Fprintf(&b, "    病院・薬局などの名称: %s\n", yamlString(provider))
+	fmt.Fprintf(&b, "    医療を受けた人: %s\n", yamlString(ntaPatient))
+	fmt.Fprintf(&b, "    病院・薬局などの名称: %s\n", yamlString(ntaProvider))
 	fmt.Fprintf(&b, "    診療・治療: %s\n", yamlString(ntaFlag(isTreatment)))
 	fmt.Fprintf(&b, "    医薬品購入: %s\n", yamlString(ntaFlag(isMedicine)))
 	fmt.Fprintf(&b, "    介護保険サービス: %s\n", yamlString(ntaFlag(isNursing)))
 	fmt.Fprintf(&b, "    その他の医療費: %s\n", yamlString(ntaFlag(isOther)))
 	fmt.Fprintf(&b, "    支払った医療費の金額: %d\n", data.Amount)
-	fmt.Fprintf(&b, "    補填される金額: %d\n", reimbursed)
+	fmt.Fprintf(&b, "    左のうち、補填される金額: %s\n", reimbursedCol)
 	fmt.Fprintf(&b, "    支払年月日: %s\n", yamlString(slashDate))
 	return b.String()
 }
