@@ -120,6 +120,23 @@ func TestSanitization(t *testing.T) {
 	}
 }
 
+func TestDeduplicateReceipts(t *testing.T) {
+	input := []ReceiptData{
+		{Date: "2024-10-18", Vendor: "川村眼科", Category: "Medical", Amount: 1740},
+		{Date: "2024-10-18", Vendor: " 川村眼科 ", Category: "medical", Amount: 1740},
+		{Date: "2024-10-18", Vendor: "川村眼科", Category: "Medical", Amount: 1740},
+		{Date: "2024-10-18", Vendor: "別の薬局", Category: "Medical", Amount: 850},
+	}
+
+	got := deduplicateReceipts(input)
+	if len(got) != 2 {
+		t.Fatalf("deduplicateReceipts() returned %d items, want 2: %+v", len(got), got)
+	}
+	if got[0].Vendor != "川村眼科" || got[1].Vendor != "別の薬局" {
+		t.Errorf("deduplicateReceipts() unexpected order/items: %+v", got)
+	}
+}
+
 func TestSaveAndArchiveWithCollisions(t *testing.T) {
 	tmpDir := t.TempDir()
 	watchTmp := filepath.Join(tmpDir, "watch")
@@ -132,43 +149,50 @@ func TestSaveAndArchiveWithCollisions(t *testing.T) {
 	destDir = destTmp
 	defer func() { destDir = oldDest }()
 
-	srcFile := filepath.Join(watchTmp, "scan001.pdf")
-	if err := os.WriteFile(srcFile, []byte("dummy-pdf-data"), 0644); err != nil {
+	srcFile1 := filepath.Join(watchTmp, "scan001.pdf")
+	if err := os.WriteFile(srcFile1, []byte("dummy-pdf-data"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Simulate two identical receipts on the same page
+	// Simulate Gemini returning duplicate entries for the same receipt in a single scan
 	receipts := []ReceiptData{
 		{Date: "2026-10-18", Vendor: "テスト医院", Category: "Medical", Amount: 1500},
 		{Date: "2026-10-18", Vendor: "テスト医院", Category: "Medical", Amount: 1500},
 	}
 
-	saveAndArchive(srcFile, receipts)
+	saveAndArchive(srcFile1, receipts)
 
-	// Verify both processed files exist without overwriting each other
+	// Verify only a single processed file was created for the duplicate entries in the same scan
 	firstProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_1500円.pdf")
 	secondProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_1500円_1.pdf")
 	archivedOriginal := filepath.Join(destTmp, "originals", "scan001.pdf")
 
-	for _, p := range []string{firstProcessed, secondProcessed, archivedOriginal} {
+	for _, p := range []string{firstProcessed, archivedOriginal} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("expected file %s to exist, got error: %v", p, err)
 		}
 	}
+	if _, err := os.Stat(secondProcessed); !os.IsNotExist(err) {
+		t.Errorf("expected duplicate entry within same scan not to create %s", secondProcessed)
+	}
 
 	// Verify original was removed from watchTmp
-	if _, err := os.Stat(srcFile); !os.IsNotExist(err) {
-		t.Errorf("expected source file %s to be moved, but still exists", srcFile)
+	if _, err := os.Stat(srcFile1); !os.IsNotExist(err) {
+		t.Errorf("expected source file %s to be moved, but still exists", srcFile1)
 	}
 
-	// Now test archiving collision when another scan001.pdf arrives
-	if err := os.WriteFile(srcFile, []byte("dummy-pdf-data-2"), 0644); err != nil {
+	// Now test a second distinct scan file that produces the same receipt filename & original name
+	if err := os.WriteFile(srcFile1, []byte("dummy-pdf-data-2"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	archiveOriginalFile(srcFile)
+	saveAndArchive(srcFile1, []ReceiptData{
+		{Date: "2026-10-18", Vendor: "テスト医院", Category: "Medical", Amount: 1500},
+	})
 	archivedSecond := filepath.Join(destTmp, "originals", "scan001_1.pdf")
-	if _, err := os.Stat(archivedSecond); err != nil {
-		t.Errorf("expected collided archive %s to exist, got error: %v", archivedSecond, err)
+	for _, p := range []string{secondProcessed, archivedSecond} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("expected collided file %s to exist on second scan, got error: %v", p, err)
+		}
 	}
 }
 
@@ -205,3 +229,15 @@ func TestWaitForStableFile(t *testing.T) {
 		t.Errorf("waitForStableFile() expected error on nonexistent file, got nil")
 	}
 }
+
+func TestEnqueueFileIgnoresMissingOrDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+	missingPath := filepath.Join(tmpDir, "already_archived.pdf")
+
+	// Should not enqueue a file that no longer exists (e.g. trailing fsnotify event after move)
+	enqueueFile(context.Background(), nil, make(chan struct{}, 1), nil, missingPath)
+	if _, loaded := activeFiles.Load(missingPath); loaded {
+		t.Errorf("expected missing file %s not to be stored in activeFiles", missingPath)
+	}
+}
+
