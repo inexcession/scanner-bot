@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -148,28 +150,32 @@ func TestSanitization(t *testing.T) {
 	misconverted := ReceiptData{
 		RawDate:  "令和8年10月2日",
 		Date:     "2024-10-02",
-		Vendor:   "医療法人社団CVIC大井町心臓クリニック",
+		Vendor:   "サンプルクリニック",
 		Category: "Medical",
 		Amount:   1850,
 	}
 	if got := resolveReceiptDate(misconverted); got != "2026-10-02" {
 		t.Errorf("resolveReceiptDate() = %q, want 2026-10-02", got)
 	}
+
+	if got := sanitizePatientName(" 山田　太郎 様 \n"); got != "山田　太郎" {
+		t.Errorf("sanitizePatientName() = %q, want 山田　太郎", got)
+	}
 }
 
 func TestDeduplicateReceipts(t *testing.T) {
 	input := []ReceiptData{
-		{Date: "2024-10-18", Vendor: "川村眼科", Category: "Medical", Amount: 1740},
-		{Date: "2024-10-18", Vendor: " 川村眼科 ", Category: "medical", Amount: 1740},
-		{Date: "2024-10-18", Vendor: "川村眼科", Category: "Medical", Amount: 1740},
-		{Date: "2024-10-18", Vendor: "別の薬局", Category: "Medical", Amount: 850},
+		{Date: "2026-10-18", Vendor: "サンプル眼科", Category: "Medical", Amount: 1740},
+		{Date: "2026-10-18", Vendor: " サンプル眼科 ", Category: "medical", Amount: 1740},
+		{Date: "2026-10-18", Vendor: "サンプル眼科", Category: "Medical", Amount: 1740},
+		{Date: "2026-10-18", Vendor: "テスト薬局", Category: "Medical", Amount: 850},
 	}
 
 	got := deduplicateReceipts(input)
 	if len(got) != 2 {
 		t.Fatalf("deduplicateReceipts() returned %d items, want 2: %+v", len(got), got)
 	}
-	if got[0].Vendor != "川村眼科" || got[1].Vendor != "別の薬局" {
+	if got[0].Vendor != "サンプル眼科" || got[1].Vendor != "テスト薬局" {
 		t.Errorf("deduplicateReceipts() unexpected order/items: %+v", got)
 	}
 }
@@ -191,17 +197,35 @@ func TestSaveAndArchiveWithCollisions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate Gemini returning duplicate entries for the same receipt in a single scan
+	// Simulate Gemini returning duplicate entries for the same Medical receipt in a single scan
 	receipts := []ReceiptData{
-		{Date: "2026-10-18", Vendor: "テスト医院", Category: "Medical", Amount: 1500},
-		{Date: "2026-10-18", Vendor: "テスト医院", Category: "Medical", Amount: 1500},
+		{
+			RawDate:      "令和8年10月18日",
+			Date:         "2026-10-18",
+			Vendor:       "テスト医院",
+			Category:     "Medical",
+			Amount:       1500,
+			PatientName:  "山田 太郎 様",
+			IsTreatment:  true,
+			IsMedicine:   false,
+		},
+		{
+			RawDate:      "令和8年10月18日",
+			Date:         "2026-10-18",
+			Vendor:       "テスト医院",
+			Category:     "Medical",
+			Amount:       1500,
+			PatientName:  "山田 太郎 様",
+			IsTreatment:  true,
+			IsMedicine:   false,
+		},
 	}
 
 	saveAndArchive(srcFile1, receipts)
 
-	// Verify only a single processed file was created for the duplicate entries in the same scan
-	firstProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_1500円.pdf")
-	secondProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_1500円_1.pdf")
+	// Verify Medical category saves as .zip containing both .pdf and .yaml with matching stem
+	firstProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_1500円.zip")
+	secondProcessed := filepath.Join(destTmp, "Medical", "2026-10-18_テスト医院_1500円_1.zip")
 	archivedOriginal := filepath.Join(destTmp, "originals", "scan001.pdf")
 
 	for _, p := range []string{firstProcessed, archivedOriginal} {
@@ -213,22 +237,66 @@ func TestSaveAndArchiveWithCollisions(t *testing.T) {
 		t.Errorf("expected duplicate entry within same scan not to create %s", secondProcessed)
 	}
 
+	// Verify zip archive contents
+	zr, err := zip.OpenReader(firstProcessed)
+	if err != nil {
+		t.Fatalf("failed to open medical zip %s: %v", firstProcessed, err)
+	}
+	defer zr.Close()
+
+	entries := make(map[string]string)
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries[f.Name] = string(b)
+	}
+
+	if gotPDF, ok := entries["2026-10-18_テスト医院_1500円.pdf"]; !ok || gotPDF != "dummy-pdf-data" {
+		t.Errorf("unexpected PDF entry in zip: ok=%v, content=%q", ok, gotPDF)
+	}
+	gotYAML, ok := entries["2026-10-18_テスト医院_1500円.yaml"]
+	if !ok {
+		t.Fatalf("missing YAML entry in zip, entries: %v", entries)
+	}
+	for _, wantLine := range []string{
+		"date: 2026-10-18",
+		"vendor: テスト医院",
+		"patient_name: 山田 太郎",
+		"treatment: true",
+		"診療・治療: 該当する",
+		"支払った医療費の金額: 1500",
+		"支払年月日: 2026/10/18",
+	} {
+		if !strings.Contains(gotYAML, wantLine) {
+			t.Errorf("YAML missing %q, got:\n%s", wantLine, gotYAML)
+		}
+	}
+
 	// Verify original was removed from watchTmp
 	if _, err := os.Stat(srcFile1); !os.IsNotExist(err) {
 		t.Errorf("expected source file %s to be moved, but still exists", srcFile1)
 	}
 
-	// Now test a second distinct scan file that produces the same receipt filename & original name
+	// Now test a second distinct scan file that produces a collided Medical .zip AND a non-Medical plain .pdf
 	if err := os.WriteFile(srcFile1, []byte("dummy-pdf-data-2"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	saveAndArchive(srcFile1, []ReceiptData{
 		{Date: "2026-10-18", Vendor: "テスト医院", Category: "Medical", Amount: 1500},
+		{Date: "2026-10-18", Vendor: "スーパー", Category: "Grocery", Amount: 980},
 	})
+	groceryProcessed := filepath.Join(destTmp, "Grocery", "2026-10-18_スーパー_980円.pdf")
 	archivedSecond := filepath.Join(destTmp, "originals", "scan001_1.pdf")
-	for _, p := range []string{secondProcessed, archivedSecond} {
+	for _, p := range []string{secondProcessed, groceryProcessed, archivedSecond} {
 		if _, err := os.Stat(p); err != nil {
-			t.Errorf("expected collided file %s to exist on second scan, got error: %v", p, err)
+			t.Errorf("expected file %s to exist on second scan, got error: %v", p, err)
 		}
 	}
 }
