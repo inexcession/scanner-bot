@@ -5,8 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/genai"
 )
 
 func TestParseGeminiResponse(t *testing.T) {
@@ -274,4 +277,24 @@ func TestEnqueueFileIgnoresMissingOrDirectory(t *testing.T) {
 		t.Errorf("expected missing file %s not to be stored in activeFiles", missingPath)
 	}
 }
+
+func TestFormatUsageStats(t *testing.T) {
+	resp := &genai.GenerateContentResponse{
+		ModelVersion: "gemini-2.5-flash-preview-09-2025",
+		UsageMetadata: &genai.GenerateContentResponseUsageMetadata{
+			PromptTokenCount:     310,
+			CandidatesTokenCount: 45,
+			ThoughtsTokenCount:   120,
+			TotalTokenCount:      475,
+		},
+	}
+
+	got := formatUsageStats(resp, 4123*time.Millisecond)
+	for _, wantSub := range []string{"model=gemini-2.5-flash-preview-09-2025", "latency=4.123s", "prompt=310", "candidates=45", "thoughts=120", "total=475"} {
+		if !strings.Contains(got, wantSub) {
+			t.Errorf("formatUsageStats() = %q, missing %q", got, wantSub)
+		}
+	}
+}
+
 

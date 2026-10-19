@@ -271,7 +271,11 @@ func processEvent(ctx context.Context, client *genai.Client, path string) {
 		return
 	}
 
-	log.Printf("Processing: %s", path)
+	var sizeBytes int64
+	if info, err := os.Stat(path); err == nil {
+		sizeBytes = info.Size()
+	}
+	log.Printf("Processing: %s (size=%d bytes)", path, sizeBytes)
 
 	dataList, err := analyzeReceipt(ctx, client, path)
 	if err != nil {
@@ -326,9 +330,33 @@ func waitForStableFile(ctx context.Context, path string) error {
 	}
 }
 
+// formatUsageStats formats Gemini response metadata (model version, latency, token counts) for logging
+func formatUsageStats(resp *genai.GenerateContentResponse, elapsed time.Duration) string {
+	modelVer := modelName
+	if resp != nil && resp.ModelVersion != "" {
+		modelVer = resp.ModelVersion
+	}
+	if resp == nil || resp.UsageMetadata == nil {
+		return fmt.Sprintf("model=%s, latency=%s", modelVer, elapsed.Round(time.Millisecond))
+	}
+	u := resp.UsageMetadata
+	if u.ThoughtsTokenCount > 0 {
+		return fmt.Sprintf("model=%s, latency=%s, tokens: prompt=%d candidates=%d thoughts=%d total=%d",
+			modelVer, elapsed.Round(time.Millisecond),
+			u.PromptTokenCount, u.CandidatesTokenCount, u.ThoughtsTokenCount, u.TotalTokenCount)
+	}
+	return fmt.Sprintf("model=%s, latency=%s, tokens: prompt=%d candidates=%d total=%d",
+		modelVer, elapsed.Round(time.Millisecond),
+		u.PromptTokenCount, u.CandidatesTokenCount, u.TotalTokenCount)
+}
+
 // analyzeReceipt uploads the file to Gemini and extracts receipt data
 func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]ReceiptData, error) {
-	// Upload
+	baseName := filepath.Base(path)
+
+	// 1. Upload
+	uploadStart := time.Now()
+	log.Printf("Uploading to Gemini Files API: %s", baseName)
 	upFile, err := client.Files.UploadFromPath(ctx, path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("upload failed: %w", err)
@@ -341,10 +369,17 @@ func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]R
 		}
 	}(upFile.Name)
 
-	// Wait for processing with a bounded timeout
+	log.Printf("Uploaded %s -> %s (mime=%s, state=%s, took=%s)",
+		baseName, upFile.Name, upFile.MIMEType, upFile.State, time.Since(uploadStart).Round(time.Millisecond))
+
+	// 2. Wait for remote file processing with a bounded timeout
 	pollCtx, pollCancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer pollCancel()
 
+	if upFile.State == genai.FileStateProcessing {
+		log.Printf("Waiting for Gemini remote file processing: %s (%s)...", baseName, upFile.Name)
+	}
+	pollStart := time.Now()
 	for upFile.State == genai.FileStateProcessing {
 		select {
 		case <-pollCtx.Done():
@@ -361,8 +396,11 @@ func analyzeReceipt(ctx context.Context, client *genai.Client, path string) ([]R
 	if upFile.State != genai.FileStateActive {
 		return nil, fmt.Errorf("file processing failed state: %s", upFile.State)
 	}
+	if time.Since(pollStart) >= time.Second {
+		log.Printf("Remote file ready: %s (took=%s)", upFile.Name, time.Since(pollStart).Round(time.Millisecond))
+	}
 
-	// Generate
+	// 3. Generate
 	now := time.Now()
 	currentYear := now.Year()
 	reiwaYear := currentYear - 2018
@@ -391,13 +429,18 @@ Japanese Era (Wareki) Conversion Rules:
 		}, genai.RoleUser),
 	}
 
+	llmStart := time.Now()
+	log.Printf("Sent to LLM (%s), waiting for response: %s...", modelName, baseName)
 	resp, err := client.Models.GenerateContent(ctx, modelName, contents, &genai.GenerateContentConfig{
 		ResponseMIMEType: "application/json",
 		ResponseSchema:   receiptResponseSchema,
 	})
+	llmElapsed := time.Since(llmStart)
 	if err != nil {
-		return nil, fmt.Errorf("gemini generate error: %w", err)
+		return nil, fmt.Errorf("gemini generate error (after %s): %w", llmElapsed.Round(time.Millisecond), err)
 	}
+
+	log.Printf("LLM response received for %s (%s)", baseName, formatUsageStats(resp, llmElapsed))
 
 	jsonText := resp.Text()
 	if jsonText == "" {
@@ -464,6 +507,14 @@ func saveAndArchive(srcPath string, dataList []ReceiptData) {
 	uniqueList := deduplicateReceipts(dataList)
 	successCount := 0
 	for _, data := range uniqueList {
+		resolvedDate := resolveReceiptDate(data)
+		if data.RawDate != "" && data.Date != "" && resolvedDate != data.Date {
+			log.Printf("Extracted receipt: raw_date=%q (llm_date=%q -> resolved=%s), vendor=%q, category=%q, amount=%d円",
+				data.RawDate, data.Date, resolvedDate, data.Vendor, data.Category, data.Amount)
+		} else {
+			log.Printf("Extracted receipt: raw_date=%q -> date=%s, vendor=%q, category=%q, amount=%d円",
+				data.RawDate, resolvedDate, data.Vendor, data.Category, data.Amount)
+		}
 		if err := saveProcessedFile(srcPath, data); err != nil {
 			log.Printf("Failed to save processed file: %v", err)
 		} else {
